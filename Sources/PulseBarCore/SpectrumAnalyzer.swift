@@ -1,0 +1,204 @@
+import Accelerate
+import Foundation
+
+/// Real-time 6-band FFT spectrum analyzer optimized for compact menu bar equalizers.
+public final class SpectrumAnalyzer {
+    public static let barCount = 6
+
+    public let fftSize: Int
+    private let halfSize: Int
+    private let log2n: vDSP_Length
+    private let fftSetup: FFTSetup
+
+    private var window: [Float]
+    private var windowed: [Float]
+    private var realBuffer: [Float]
+    private var imagBuffer: [Float]
+    private var squaredMagnitudes: [Float]
+
+    private var agcPeakDB: Float = -18.0
+    private var smoothedBars: [Double] = [Double](repeating: 0, count: barCount)
+
+    private static let bandRanges: [(low: Double, high: Double)] = [
+        (45, 110),     // 0: Sub-bass
+        (110, 260),    // 1: Bass / kick punch
+        (260, 650),    // 2: Low-mids / warmth
+        (650, 1600),   // 3: Mids / vocals
+        (1600, 4200),  // 4: Upper-mids / presence
+        (4200, 11500)  // 5: Brilliance / hi-hats
+    ]
+
+    private static let spectralTiltGains: [Float] = [
+        0.82, 0.92, 1.05, 1.28, 1.60, 2.15
+    ]
+
+    public init(fftSize: Int = 2048) {
+        precondition(fftSize > 0 && (fftSize & (fftSize - 1)) == 0, "fftSize must be a power of 2")
+        self.fftSize = fftSize
+        self.halfSize = fftSize / 2
+        self.log2n = vDSP_Length(log2(Double(fftSize)))
+        guard let setup = vDSP_create_fftsetup(self.log2n, FFTRadix(kFFTRadix2)) else {
+            fatalError("Failed to create vDSP FFTSetup for size \(fftSize)")
+        }
+        self.fftSetup = setup
+
+        self.window = [Float](repeating: 0, count: fftSize)
+        vDSP_hann_window(&self.window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+
+        self.windowed = [Float](repeating: 0, count: fftSize)
+        self.realBuffer = [Float](repeating: 0, count: halfSize)
+        self.imagBuffer = [Float](repeating: 0, count: halfSize)
+        self.squaredMagnitudes = [Float](repeating: 0, count: halfSize)
+    }
+
+    deinit {
+        vDSP_destroy_fftsetup(fftSetup)
+    }
+
+    /// True once all smoothed bar values have decayed to rest (`< 0.004`).
+    public var isSettledAtRest: Bool {
+        smoothedBars.allSatisfy { $0 < 0.004 }
+    }
+
+    /// Current smoothed normalized bar heights in `0...1`.
+    public var currentBars: [Double] {
+        smoothedBars
+    }
+
+    /// Computes updated normalized `[0...1]` heights for the 6 visualizer bars.
+    /// When `isActive` is `false`, bars smoothly decay toward `0`.
+    public func process(
+        samples: [Float],
+        sampleRate: Double,
+        isActive: Bool,
+        style: EqualizerStyle,
+        sensitivity: Double,
+        deltaTime: TimeInterval
+    ) -> [Double] {
+        let dt = min(0.1, max(1.0 / 120.0, deltaTime))
+
+        let targets: [Double]
+        if isActive && samples.count == fftSize && sampleRate > 8_000 {
+            let rawBands = computeSixBandLevels(samples: samples, sampleRate: sampleRate, sensitivity: sensitivity)
+            targets = mapBandsToStyle(rawBands, style: style)
+        } else {
+            targets = [Double](repeating: 0, count: Self.barCount)
+            // Slowly relax AGC while idle so the next track re-calibrates naturally.
+            agcPeakDB = max(-24.0, agcPeakDB - Float(dt) * 2.0)
+        }
+
+        let attackAlpha = 1.0 - exp(-dt / 0.030)
+        let decayAlpha = 1.0 - exp(-dt / 0.145)
+
+        for i in 0..<Self.barCount {
+            let target = targets[i]
+            let current = smoothedBars[i]
+            let alpha = target > current ? attackAlpha : decayAlpha
+            let next = current + (target - current) * alpha
+            smoothedBars[i] = next < 0.001 ? 0.0 : min(1.0, next)
+        }
+
+        return smoothedBars
+    }
+
+    /// Resets internal smoothing and AGC history immediately.
+    public func reset() {
+        agcPeakDB = -18.0
+        for i in 0..<Self.barCount {
+            smoothedBars[i] = 0
+        }
+    }
+
+    private func computeSixBandLevels(
+        samples: [Float],
+        sampleRate: Double,
+        sensitivity: Double
+    ) -> [Double] {
+        vDSP_vmul(samples, 1, window, 1, &windowed, 1, vDSP_Length(fftSize))
+
+        realBuffer.withUnsafeMutableBufferPointer { realPtr in
+            imagBuffer.withUnsafeMutableBufferPointer { imagPtr in
+                var splitComplex = DSPSplitComplex(
+                    realp: realPtr.baseAddress!,
+                    imagp: imagPtr.baseAddress!
+                )
+
+                windowed.withUnsafeBufferPointer { winPtr in
+                    winPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfSize) { complexPtr in
+                        vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(halfSize))
+                    }
+                }
+
+                vDSP_fft_zrip(fftSetup, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
+                vDSP_zvmags(&splitComplex, 1, &squaredMagnitudes, 1, vDSP_Length(halfSize))
+            }
+        }
+
+        let binHz = sampleRate / Double(fftSize)
+        let normScale = 1.0 / Float(fftSize)
+        var bandDBs = [Float](repeating: -80.0, count: Self.barCount)
+        var frameMaxDB: Float = -80.0
+
+        for (index, range) in Self.bandRanges.enumerated() {
+            let startBin = max(1, Int(floor(range.low / binHz)))
+            let endBin = min(halfSize - 1, max(startBin, Int(ceil(range.high / binHz))))
+            let count = endBin - startBin + 1
+
+            var sumSq: Float = 0
+            var peakSq: Float = 0
+            for bin in startBin...endBin {
+                let sq = squaredMagnitudes[bin]
+                sumSq += sq
+                if sq > peakSq {
+                    peakSq = sq
+                }
+            }
+
+            let rmsMag = sqrtf(sumSq / Float(max(1, count))) * normScale
+            let peakMag = sqrtf(peakSq) * normScale
+            let weightedMag = (0.60 * peakMag + 0.40 * rmsMag) * Self.spectralTiltGains[index]
+
+            let db = 20.0 * log10f(max(weightedMag, 1e-6))
+            bandDBs[index] = db
+            if db > frameMaxDB {
+                frameMaxDB = db
+            }
+        }
+
+        // Rolling automatic gain control so quiet and loud masters both animate cleanly.
+        if frameMaxDB > agcPeakDB {
+            agcPeakDB = agcPeakDB + (frameMaxDB - agcPeakDB) * 0.25
+        } else {
+            agcPeakDB = max(-34.0, agcPeakDB - 0.025)
+        }
+        let ceilingDB = min(-2.0, max(-32.0, agcPeakDB + 2.0))
+        let dynamicRangeDB: Float = 36.0 / Float(max(0.5, min(1.8, sensitivity)))
+        let floorDB = ceilingDB - dynamicRangeDB
+
+        return bandDBs.map { db in
+            let normalized = (db - floorDB) / (ceilingDB - floorDB)
+            let clamped = max(0.0, min(1.0, Double(normalized)))
+            // Mild perceptual curve so mid-level beats remain expressive.
+            return pow(clamped, 1.15)
+        }
+    }
+
+    private func mapBandsToStyle(_ bands: [Double], style: EqualizerStyle) -> [Double] {
+        guard bands.count == Self.barCount else { return bands }
+        switch style {
+        case .classic:
+            return bands
+        case .island:
+            // Arrange 6 real frequency bands in a balanced Dynamic-Island envelope:
+            // outer sparkle/air, inner warmth/sub-bass, center punch/vocals.
+            return [
+                bands[4] * 0.46,
+                bands[2] * 0.78,
+                bands[1] * 1.00,
+                bands[3] * 1.00,
+                bands[0] * 0.78,
+                bands[5] * 0.46
+            ]
+        }
+    }
+}

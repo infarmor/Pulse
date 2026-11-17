@@ -12,7 +12,7 @@ let package = Package(
             targets: ["PulseBarCore"]
         ),
         .executable(
-            name: "PulseBar",
+            name: "Pulse",
             targets: ["PulseBar"]
         )
     ],

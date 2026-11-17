@@ -1,7 +1,10 @@
 import AudioToolbox
 import CoreAudio
 import Foundation
+import os
 import PulseBarCore
+
+let pulseLog = Logger(subsystem: "dev.pulsebar.app", category: "audio")
 
 /// Captures live system audio PCM samples via CoreAudio Process Tap (`macOS 14.2+`)
 /// into a real-time-safe `AudioRingBuffer`.
@@ -15,6 +18,9 @@ final class CoreAudioTapEngine: @unchecked Sendable {
     private var ioProcID: AudioDeviceIOProcID?
     private var isStarted = false
     private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
+    private var serviceRestartListenerBlock: AudioObjectPropertyListenerBlock?
+    /// Per-device listeners (aggregate sample rate, tap format); removed on teardown.
+    private var deviceListeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private var pendingRestartWorkItem: DispatchWorkItem?
 
     /// Pre-allocated scratch buffer for multi-channel downmix in the real-time IOProc.
@@ -49,7 +55,7 @@ final class CoreAudioTapEngine: @unchecked Sendable {
         queue.sync {
             pendingRestartWorkItem?.cancel()
             pendingRestartWorkItem = nil
-            removeDefaultOutputListener()
+            removeSystemListeners()
             teardownTapOnQueue()
             onStatusChange(.idle)
         }
@@ -86,6 +92,8 @@ final class CoreAudioTapEngine: @unchecked Sendable {
             } else if self.isStarted, let ioProcID = self.ioProcID {
                 AudioDeviceStop(self.aggregateDeviceID, ioProcID)
                 self.isStarted = false
+                // Drop the last captured audio so nothing keeps analysing a frozen snapshot.
+                self.ringBuffer.reset()
             }
         }
     }
@@ -103,11 +111,11 @@ final class CoreAudioTapEngine: @unchecked Sendable {
         }
 
         onStatusChange(.starting)
-        installDefaultOutputListenerIfNeeded()
+        installSystemListenersIfNeeded()
 
         let tapDescription = CATapDescription(monoGlobalTapButExcludeProcesses: [])
         tapDescription.uuid = UUID()
-        tapDescription.name = "PulseBar System Audio Tap"
+        tapDescription.name = "Pulse System Audio Tap"
         tapDescription.isPrivate = true
         tapDescription.muteBehavior = .unmuted
 
@@ -121,12 +129,13 @@ final class CoreAudioTapEngine: @unchecked Sendable {
 
         let tapUID = readTapUID(tapID: createdTapID) ?? tapDescription.uuid.uuidString
         let tapFormat = readTapFormat(tapID: createdTapID)
-        let sampleRate = tapFormat?.mSampleRate ?? 48_000
-        ringBuffer.setSampleRate(sampleRate)
 
-        let outputUID = readDefaultOutputDeviceUID()
-        var aggregateDesc: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "PulseBar-AudioTap",
+        // Tap-only private aggregate. The default output device is deliberately NOT added as a
+        // sub-device: devices such as AirPods or USB headsets would bring their microphone into
+        // the aggregate's input scope, so starting IO would switch them to call-quality (HFP),
+        // light the mic indicator, and mix the mic into the visualizer.
+        let aggregateDesc: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Pulse-AudioTap",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
@@ -139,13 +148,6 @@ final class CoreAudioTapEngine: @unchecked Sendable {
             ]
         ]
 
-        if let outputUID {
-            aggregateDesc[kAudioAggregateDeviceSubDeviceListKey] = [
-                [kAudioSubDeviceUIDKey: outputUID]
-            ]
-            aggregateDesc[kAudioAggregateDeviceMainSubDeviceKey] = outputUID
-        }
-
         var createdAggID = AudioObjectID(kAudioObjectUnknown)
         let aggStatus = AudioHardwareCreateAggregateDevice(aggregateDesc as CFDictionary, &createdAggID)
         guard aggStatus == noErr, createdAggID != AudioObjectID(kAudioObjectUnknown) else {
@@ -156,9 +158,15 @@ final class CoreAudioTapEngine: @unchecked Sendable {
         }
         aggregateDeviceID = createdAggID
 
+        // The aggregate's nominal rate is what the IOProc actually delivers.
+        let sampleRate = readNominalSampleRate(deviceID: createdAggID) ?? tapFormat?.mSampleRate ?? 48_000
+        ringBuffer.setSampleRate(sampleRate)
+        installDeviceListeners(aggregateID: createdAggID, tapID: createdTapID)
+
         let isFloat = ((tapFormat?.mFormatFlags ?? kAudioFormatFlagIsFloat) & kAudioFormatFlagIsFloat) != 0
         let bitsPerChannel = tapFormat?.mBitsPerChannel ?? 32
         let scratch = DownmixScratch()
+        pulseLog.notice("tap created id=\(createdTapID, privacy: .public) uid=\(tapUID, privacy: .public) fmtRead=\(tapFormat != nil, privacy: .public) sr=\(sampleRate, privacy: .public) ch=\(tapFormat?.mChannelsPerFrame ?? 0, privacy: .public) flags=\(tapFormat?.mFormatFlags ?? 0, privacy: .public) bits=\(tapFormat?.mBitsPerChannel ?? 0, privacy: .public) isFloat=\(isFloat, privacy: .public) agg=\(createdAggID, privacy: .public)")
         let ring = ringBuffer
 
         var newIOProcID: AudioDeviceIOProcID?
@@ -172,56 +180,31 @@ final class CoreAudioTapEngine: @unchecked Sendable {
             let bufferList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
             guard !bufferList.isEmpty else { return }
 
-            if bufferList.count == 1 {
-                let buf = bufferList[0]
-                guard let rawPtr = buf.mData, buf.mDataByteSize > 0 else { return }
-                let channels = max(1, Int(buf.mNumberChannels))
-                let totalFloats = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
-                let frameCount = totalFloats / channels
-                guard frameCount > 0 else { return }
+            // The tap stream is the last input stream of the aggregate; read only that one.
+            let buf = bufferList[bufferList.count - 1]
+            guard let rawPtr = buf.mData, buf.mDataByteSize > 0 else { return }
+            let channels = max(1, Int(buf.mNumberChannels))
+            let frameCount = Int(buf.mDataByteSize) / MemoryLayout<Float>.size / channels
+            guard frameCount > 0 else { return }
 
-                let floatPtr = rawPtr.assumingMemoryBound(to: Float.self)
-                if channels == 1 {
-                    ring.write(UnsafeBufferPointer(start: floatPtr, count: frameCount))
-                } else {
-                    let usableFrames = min(frameCount, scratch.buffer.count)
-                    let invChannels = 1.0 / Float(channels)
-                    scratch.buffer.withUnsafeMutableBufferPointer { dst in
-                        guard let dstPtr = dst.baseAddress else { return }
-                        for frame in 0..<usableFrames {
-                            var sum: Float = 0
-                            let base = frame * channels
-                            for ch in 0..<channels {
-                                sum += floatPtr[base + ch]
-                            }
-                            dstPtr[frame] = sum * invChannels
-                        }
-                        ring.write(UnsafeBufferPointer(start: dstPtr, count: usableFrames))
-                    }
-                }
+            let floatPtr = rawPtr.assumingMemoryBound(to: Float.self)
+            if channels == 1 {
+                ring.write(UnsafeBufferPointer(start: floatPtr, count: frameCount))
                 return
             }
 
-            // Non-interleaved multi-buffer fallback: average channel 0..N-1.
-            let firstBuf = bufferList[0]
-            guard firstBuf.mData != nil, firstBuf.mDataByteSize > 0 else { return }
-            let frameCount = Int(firstBuf.mDataByteSize) / MemoryLayout<Float>.size
+            // Interleaved multi-channel: downmix to mono into preallocated scratch.
             let usableFrames = min(frameCount, scratch.buffer.count)
-            guard usableFrames > 0 else { return }
-
-            let invBuffers = 1.0 / Float(bufferList.count)
+            let invChannels = 1.0 / Float(channels)
             scratch.buffer.withUnsafeMutableBufferPointer { dst in
                 guard let dstPtr = dst.baseAddress else { return }
                 for frame in 0..<usableFrames {
-                    dstPtr[frame] = 0
-                }
-                for buf in bufferList {
-                    guard let ptr = buf.mData else { continue }
-                    let chPtr = ptr.assumingMemoryBound(to: Float.self)
-                    let count = min(usableFrames, Int(buf.mDataByteSize) / MemoryLayout<Float>.size)
-                    for frame in 0..<count {
-                        dstPtr[frame] += chPtr[frame] * invBuffers
+                    var sum: Float = 0
+                    let base = frame * channels
+                    for ch in 0..<channels {
+                        sum += floatPtr[base + ch]
                     }
+                    dstPtr[frame] = sum * invChannels
                 }
                 ring.write(UnsafeBufferPointer(start: dstPtr, count: usableFrames))
             }
@@ -246,6 +229,7 @@ final class CoreAudioTapEngine: @unchecked Sendable {
     }
 
     private func teardownTapOnQueue() {
+        removeDeviceListeners()
         if let proc = ioProcID, aggregateDeviceID != AudioObjectID(kAudioObjectUnknown) {
             if isStarted {
                 AudioDeviceStop(aggregateDeviceID, proc)
@@ -264,85 +248,123 @@ final class CoreAudioTapEngine: @unchecked Sendable {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
+        ringBuffer.reset()
     }
 
-    private func installDefaultOutputListenerIfNeeded() {
-        guard defaultOutputListenerBlock == nil else { return }
-
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            guard let self else { return }
-            self.pendingRestartWorkItem?.cancel()
-            let item = DispatchWorkItem { [weak self] in
-                guard let self, self.tapID != AudioObjectID(kAudioObjectUnknown) else { return }
-                let wasStarted = self.isStarted
-                self.teardownTapOnQueue()
-                self.startOnQueue()
-                if !wasStarted, self.isStarted, let proc = self.ioProcID {
-                    AudioDeviceStop(self.aggregateDeviceID, proc)
-                    self.isStarted = false
-                }
+    /// Debounced teardown + restart on the engine queue. Keeps the previous IO state
+    /// (a paused tap stays paused after the rebuild).
+    private func scheduleRestart(reason: String) {
+        pendingRestartWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.tapID != AudioObjectID(kAudioObjectUnknown) else { return }
+            pulseLog.notice("restarting tap: \(reason, privacy: .public)")
+            let wasStarted = self.isStarted
+            self.teardownTapOnQueue()
+            self.startOnQueue()
+            if !wasStarted, self.isStarted, let proc = self.ioProcID {
+                AudioDeviceStop(self.aggregateDeviceID, proc)
+                self.isStarted = false
             }
-            self.pendingRestartWorkItem = item
-            self.queue.asyncAfter(deadline: .now() + 0.35, execute: item)
+        }
+        pendingRestartWorkItem = item
+        queue.asyncAfter(deadline: .now() + 0.35, execute: item)
+    }
+
+    private func installSystemListenersIfNeeded() {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+
+        if defaultOutputListenerBlock == nil {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.scheduleRestart(reason: "default output changed")
+            }
+            if AudioObjectAddPropertyListenerBlock(system, &address, queue, block) == noErr {
+                defaultOutputListenerBlock = block
+            }
         }
 
-        let status = AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            queue,
-            block
-        )
-        if status == noErr {
-            defaultOutputListenerBlock = block
+        if serviceRestartListenerBlock == nil {
+            // coreaudiod restarted: our private tap/aggregate are gone and must be rebuilt.
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyServiceRestarted,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.scheduleRestart(reason: "audio service restarted")
+            }
+            if AudioObjectAddPropertyListenerBlock(system, &address, queue, block) == noErr {
+                serviceRestartListenerBlock = block
+            }
         }
     }
 
-    private func removeDefaultOutputListener() {
-        guard let block = defaultOutputListenerBlock else { return }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        AudioObjectRemovePropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            queue,
-            block
-        )
-        defaultOutputListenerBlock = nil
+    private func removeSystemListeners() {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        if let block = defaultOutputListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(system, &address, queue, block)
+            defaultOutputListenerBlock = nil
+        }
+        if let block = serviceRestartListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyServiceRestarted,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(system, &address, queue, block)
+            serviceRestartListenerBlock = nil
+        }
     }
 
-    private func readDefaultOutputDeviceUID() -> String? {
-        var deviceID = AudioObjectID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    /// Rebuild when the stream's rate or format changes (e.g. a DAC switched to 96 kHz,
+    /// Bluetooth renegotiation), otherwise the FFT bands would map to the wrong frequencies.
+    private func installDeviceListeners(aggregateID: AudioObjectID, tapID: AudioObjectID) {
+        let watched: [(AudioObjectID, AudioObjectPropertySelector, String)] = [
+            (aggregateID, kAudioDevicePropertyNominalSampleRate, "sample rate changed"),
+            (tapID, kAudioTapPropertyFormat, "tap format changed")
+        ]
+        for (object, selector, reason) in watched {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.scheduleRestart(reason: reason)
+            }
+            if AudioObjectAddPropertyListenerBlock(object, &address, queue, block) == noErr {
+                deviceListeners.append((object, address, block))
+            }
+        }
+    }
+
+    private func removeDeviceListeners() {
+        for (object, address, block) in deviceListeners {
+            var address = address
+            AudioObjectRemovePropertyListenerBlock(object, &address, queue, block)
+        }
+        deviceListeners.removeAll()
+    }
+
+    private func readNominalSampleRate(deviceID: AudioObjectID) -> Double? {
+        var rate = Float64(0)
+        var size = UInt32(MemoryLayout<Float64>.size)
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        let devStatus = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0,
-            nil,
-            &size,
-            &deviceID
-        )
-        guard devStatus == noErr, deviceID != AudioObjectID(kAudioObjectUnknown) else {
-            return nil
-        }
-
-        return readCFStringProperty(
-            objectID: deviceID,
-            selector: kAudioDevicePropertyDeviceUID
-        )
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate)
+        return status == noErr && rate > 8_000 ? rate : nil
     }
 
     private func readTapUID(tapID: AudioObjectID) -> String? {

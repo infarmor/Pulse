@@ -143,4 +143,92 @@ struct PulseBarCoreTests {
         #expect(formatPlaybackTime(65) == "1:05")
         #expect(formatPlaybackTime(3661) == "1:01:01")
     }
+
+    @Test("SpectrumAnalyzer stays lively for quiet post-volume input (-45 dBFS)")
+    func spectrumAnalyzerQuietInput() {
+        let analyzer = SpectrumAnalyzer(fftSize: 2_048)
+        let sampleRate = 48_000.0
+        let quiet = (0..<2_048).map { i -> Float in
+            0.005 * sinf(Float(2.0 * .pi * 170.0 * Double(i) / sampleRate))
+        }
+        var bars: [Double] = []
+        // ~5 s of audio: AGC releases from its start level down to the quiet signal.
+        for _ in 0..<250 {
+            bars = analyzer.process(
+                samples: quiet,
+                sampleRate: sampleRate,
+                isActive: true,
+                style: .classic,
+                sensitivity: 1.0,
+                deltaTime: 0.02
+            )
+        }
+        #expect(bars[1] > 0.6, "bars: \(bars)")
+        #expect(bars[1] > bars[5])
+    }
+
+    @Test("Settings saved by older versions still decode")
+    func legacySettingsDecode() throws {
+        let json = #"{"equalizerStyle":"classic","onlyWhenMusicPlaying":false,"hidePillWhenStopped":true,"sensitivity":1.2}"#
+        let decoded = try JSONDecoder().decode(VisualizerSettings.self, from: Data(json.utf8))
+        #expect(decoded.equalizerStyle == .classic)
+        #expect(decoded.onlyWhenMusicPlaying == false)
+        #expect(decoded.pillSize == .regular)
+        #expect(decoded.tintBarsWithArtwork == true)
+    }
+
+    @Test("ArtworkPalette picks the dominant vivid hue and ignores grayscale covers")
+    func artworkAccent() {
+        func bitmap(_ pixel: (Int) -> (UInt8, UInt8, UInt8)) -> [UInt8] {
+            (0..<(24 * 24)).flatMap { i -> [UInt8] in
+                let (r, g, b) = pixel(i)
+                return [r, g, b, 255]
+            }
+        }
+
+        // Mostly dark-gray cover with a red area (40%) and a small blue patch (10%).
+        let mixed = bitmap { i in
+            if i < 230 { return (220, 30, 40) }
+            if i < 288 { return (30, 60, 220) }
+            return (40, 40, 40)
+        }
+        let accent = ArtworkPalette.accentColor(rgba: mixed, width: 24, height: 24)
+        #expect(accent != nil)
+        if let accent {
+            #expect(accent.red > 0.7 && accent.green < 0.3 && accent.blue < 0.3)
+            let tint = ArtworkPalette.legibleBarTint(accent)
+            #expect(max(tint.red, tint.green, tint.blue) >= 0.87)
+        }
+
+        let gray = bitmap { i in i % 2 == 0 ? (30, 30, 30) : (200, 200, 200) }
+        #expect(ArtworkPalette.accentColor(rgba: gray, width: 24, height: 24) == nil)
+    }
+
+    @Test("Higher sensitivity makes bars taller, not shorter")
+    func sensitivityDirection() {
+        let sampleRate = 48_000.0
+        // Loud bass plus a much quieter treble detail.
+        let mix = (0..<2_048).map { i -> Float in
+            let t = Double(i) / sampleRate
+            return 0.5 * sinf(Float(2.0 * .pi * 170.0 * t)) + 0.01 * sinf(Float(2.0 * .pi * 6_000.0 * t))
+        }
+        func bars(sensitivity: Double) -> [Double] {
+            let analyzer = SpectrumAnalyzer(fftSize: 2_048)
+            var out: [Double] = []
+            for _ in 0..<60 {
+                out = analyzer.process(
+                    samples: mix,
+                    sampleRate: sampleRate,
+                    isActive: true,
+                    style: .classic,
+                    sensitivity: sensitivity,
+                    deltaTime: 0.02
+                )
+            }
+            return out
+        }
+        let low = bars(sensitivity: 0.6)
+        let high = bars(sensitivity: 1.6)
+        #expect(high[5] > low[5], "low: \(low) high: \(high)")
+    }
 }

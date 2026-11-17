@@ -70,6 +70,81 @@ public enum EqualizerStyle: String, CaseIterable, Codable, Sendable, Identifiabl
     }
 }
 
+/// Size preset of the menu bar capsule.
+public enum PillSize: String, CaseIterable, Codable, Sendable, Identifiable {
+    case compact
+    case regular
+    case large
+
+    public var id: String { rawValue }
+
+    public var localizedName: String {
+        switch self {
+        case .compact: return "S"
+        case .regular: return "M"
+        case .large: return "L"
+        }
+    }
+
+    public var metrics: PillMetrics {
+        switch self {
+        case .compact:
+            return PillMetrics(
+                statusItemWidth: 66, width: 64, height: 24, artwork: 18,
+                contentSpacing: 7, trailingPadding: 9,
+                barWidth: 2.6, barSpacing: 2.0, barMinHeight: 3, barMaxHeight: 13
+            )
+        case .regular:
+            return PillMetrics(
+                statusItemWidth: 78, width: 76, height: 28, artwork: 22,
+                contentSpacing: 8, trailingPadding: 11,
+                barWidth: 3.0, barSpacing: 2.4, barMinHeight: 3.5, barMaxHeight: 16
+            )
+        case .large:
+            return PillMetrics(
+                statusItemWidth: 92, width: 90, height: 32, artwork: 26,
+                contentSpacing: 9, trailingPadding: 13,
+                barWidth: 3.6, barSpacing: 2.8, barMinHeight: 4, barMaxHeight: 19
+            )
+        }
+    }
+}
+
+/// Background material of the menu bar capsule.
+public enum PillBackground: String, CaseIterable, Codable, Sendable, Identifiable {
+    case glass
+    case clearGlass
+    case solid
+
+    public var id: String { rawValue }
+
+    public var localizedName: String {
+        switch self {
+        case .glass: return "Стекло"
+        case .clearGlass: return "Прозрачное"
+        case .solid: return "Тёмное"
+        }
+    }
+}
+
+/// Layout numbers (in points) for one `PillSize`.
+public struct PillMetrics: Sendable, Equatable {
+    public let statusItemWidth: Double
+    public let width: Double
+    public let height: Double
+    /// Circular artwork diameter; inset so it sits concentric with the capsule's end.
+    public let artwork: Double
+    public let contentSpacing: Double
+    public let trailingPadding: Double
+    public let barWidth: Double
+    public let barSpacing: Double
+    public let barMinHeight: Double
+    public let barMaxHeight: Double
+
+    /// Equal inset on top, bottom, and leading edge so the round artwork is concentric with the capsule.
+    public var artworkInset: Double { (height - artwork) / 2 }
+}
+
 /// Health state of the CoreAudio process tap stream.
 public enum AudioTapStatus: Equatable, Sendable {
     case idle
@@ -94,17 +169,55 @@ public struct VisualizerSettings: Codable, Equatable, Sendable {
     public var onlyWhenMusicPlaying: Bool
     public var hidePillWhenStopped: Bool
     public var sensitivity: Double
+    public var pillSize: PillSize
+    /// Tint equalizer bars with the dominant color of the album artwork.
+    public var tintBarsWithArtwork: Bool
+    public var pillBackground: PillBackground
+    /// Tint the capsule background with the artwork color.
+    public var tintGlassWithArtwork: Bool
 
     public init(
         equalizerStyle: EqualizerStyle = .island,
         onlyWhenMusicPlaying: Bool = true,
         hidePillWhenStopped: Bool = false,
-        sensitivity: Double = 1.0
+        sensitivity: Double = 1.0,
+        pillSize: PillSize = .regular,
+        tintBarsWithArtwork: Bool = true,
+        pillBackground: PillBackground = .glass,
+        tintGlassWithArtwork: Bool = false
     ) {
         self.equalizerStyle = equalizerStyle
         self.onlyWhenMusicPlaying = onlyWhenMusicPlaying
         self.hidePillWhenStopped = hidePillWhenStopped
         self.sensitivity = min(1.8, max(0.5, sensitivity))
+        self.pillSize = pillSize
+        self.tintBarsWithArtwork = tintBarsWithArtwork
+        self.pillBackground = pillBackground
+        self.tintGlassWithArtwork = tintGlassWithArtwork
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case equalizerStyle, onlyWhenMusicPlaying, hidePillWhenStopped, sensitivity, pillSize
+        case tintBarsWithArtwork, pillBackground, tintGlassWithArtwork
+    }
+
+    /// Tolerates settings saved by older versions (missing keys fall back to defaults).
+    public init(from decoder: Decoder) throws {
+        let defaults = VisualizerSettings()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            equalizerStyle: (try? c.decodeIfPresent(EqualizerStyle.self, forKey: .equalizerStyle)) ?? defaults.equalizerStyle,
+            onlyWhenMusicPlaying: (try? c.decodeIfPresent(Bool.self, forKey: .onlyWhenMusicPlaying)) ?? defaults.onlyWhenMusicPlaying,
+            hidePillWhenStopped: (try? c.decodeIfPresent(Bool.self, forKey: .hidePillWhenStopped)) ?? defaults.hidePillWhenStopped,
+            sensitivity: (try? c.decodeIfPresent(Double.self, forKey: .sensitivity)) ?? defaults.sensitivity,
+            pillSize: (try? c.decodeIfPresent(PillSize.self, forKey: .pillSize)) ?? defaults.pillSize,
+            tintBarsWithArtwork: (try? c.decodeIfPresent(Bool.self, forKey: .tintBarsWithArtwork))
+                ?? defaults.tintBarsWithArtwork,
+            pillBackground: (try? c.decodeIfPresent(PillBackground.self, forKey: .pillBackground))
+                ?? defaults.pillBackground,
+            tintGlassWithArtwork: (try? c.decodeIfPresent(Bool.self, forKey: .tintGlassWithArtwork))
+                ?? defaults.tintGlassWithArtwork
+        )
     }
 }
 

@@ -16,7 +16,8 @@ public final class SpectrumAnalyzer {
     private var imagBuffer: [Float]
     private var squaredMagnitudes: [Float]
 
-    private var agcPeakDB: Float = -18.0
+    private var agcPeakDB: Float = SpectrumAnalyzer.initialAGCPeakDB
+    private static let initialAGCPeakDB: Float = -30.0
     private var smoothedBars: [Double] = [Double](repeating: 0, count: barCount)
 
     private static let bandRanges: [(low: Double, high: Double)] = [
@@ -79,12 +80,17 @@ public final class SpectrumAnalyzer {
 
         let targets: [Double]
         if isActive && samples.count == fftSize && sampleRate > 8_000 {
-            let rawBands = computeSixBandLevels(samples: samples, sampleRate: sampleRate, sensitivity: sensitivity)
+            let rawBands = computeSixBandLevels(
+                samples: samples,
+                sampleRate: sampleRate,
+                sensitivity: sensitivity,
+                deltaTime: dt
+            )
             targets = mapBandsToStyle(rawBands, style: style)
         } else {
             targets = [Double](repeating: 0, count: Self.barCount)
-            // Slowly relax AGC while idle so the next track re-calibrates naturally.
-            agcPeakDB = max(-24.0, agcPeakDB - Float(dt) * 2.0)
+            // Slowly drift AGC toward a neutral level while idle so the next track re-calibrates quickly.
+            agcPeakDB += (Self.initialAGCPeakDB - agcPeakDB) * Float(min(1.0, dt * 0.5))
         }
 
         let attackAlpha = 1.0 - exp(-dt / 0.030)
@@ -103,7 +109,7 @@ public final class SpectrumAnalyzer {
 
     /// Resets internal smoothing and AGC history immediately.
     public func reset() {
-        agcPeakDB = -18.0
+        agcPeakDB = Self.initialAGCPeakDB
         for i in 0..<Self.barCount {
             smoothedBars[i] = 0
         }
@@ -112,7 +118,8 @@ public final class SpectrumAnalyzer {
     private func computeSixBandLevels(
         samples: [Float],
         sampleRate: Double,
-        sensitivity: Double
+        sensitivity: Double,
+        deltaTime: Double
     ) -> [Double] {
         vDSP_vmul(samples, 1, window, 1, &windowed, 1, vDSP_Length(fftSize))
 
@@ -165,14 +172,23 @@ public final class SpectrumAnalyzer {
             }
         }
 
-        // Rolling automatic gain control so quiet and loud masters both animate cleanly.
-        if frameMaxDB > agcPeakDB {
-            agcPeakDB = agcPeakDB + (frameMaxDB - agcPeakDB) * 0.25
-        } else {
-            agcPeakDB = max(-34.0, agcPeakDB - 0.025)
+        // Effectively digital silence: don't let AGC chase the noise floor.
+        if frameMaxDB < -96.0 {
+            return [Double](repeating: 0, count: Self.barCount)
         }
-        let ceilingDB = min(-2.0, max(-32.0, agcPeakDB + 2.0))
-        let dynamicRangeDB: Float = 36.0 / Float(max(0.5, min(1.8, sensitivity)))
+
+        // Rolling automatic gain control. The process tap delivers audio *after* the system
+        // volume, so the level can sit anywhere from ~0 dBFS down to -70 dBFS depending on
+        // the volume slider. Track the recent peak over that whole range: fast attack,
+        // ~5 dB/s release, so bars stay lively at any volume.
+        if frameMaxDB > agcPeakDB {
+            agcPeakDB += (frameMaxDB - agcPeakDB) * 0.35
+        } else {
+            agcPeakDB = max(-90.0, agcPeakDB - Float(deltaTime) * 5.0)
+        }
+        let ceilingDB = min(0.0, agcPeakDB + 1.5)
+        // Higher sensitivity = wider window below the peak = taller bars for quieter detail.
+        let dynamicRangeDB: Float = 30.0 * Float(max(0.5, min(1.8, sensitivity)))
         let floorDB = ceilingDB - dynamicRangeDB
 
         return bandDBs.map { db in
@@ -192,12 +208,12 @@ public final class SpectrumAnalyzer {
             // Arrange 6 real frequency bands in a balanced Dynamic-Island envelope:
             // outer sparkle/air, inner warmth/sub-bass, center punch/vocals.
             return [
-                bands[4] * 0.46,
-                bands[2] * 0.78,
+                bands[4] * 0.62,
+                bands[2] * 0.86,
                 bands[1] * 1.00,
                 bands[3] * 1.00,
-                bands[0] * 0.78,
-                bands[5] * 0.46
+                bands[0] * 0.86,
+                bands[5] * 0.62
             ]
         }
     }

@@ -93,6 +93,8 @@ final class AppleMusicBridge {
                         artworkMissing: artworkMissingForNow
                     )
                 } else {
+                    // Music is running even if we couldn't read it (e.g. Automation denied).
+                    self.currentTrack.isMusicRunning = true
                     self.emitUpdate()
                 }
             }
@@ -159,18 +161,25 @@ final class AppleMusicBridge {
     }
 
     private func sendSimpleCommand(_ command: String) {
-        guard isMusicAppRunning() else {
-            openAppleMusic()
+        let musicRunning = isMusicAppRunning()
+        if !musicRunning && command != "playpause" {
+            // Next / previous make no sense with Music closed.
             return
         }
 
-        let source = """
-        tell application id "com.apple.Music"
-            \(command)
-        end tell
-        """
+        // With Music closed, "play" launches it in the background and starts playback.
+        let source = musicRunning
+            ? """
+            tell application id "com.apple.Music"
+                \(command)
+            end tell
+            """
+            : """
+            tell application id "com.apple.Music" to play
+            """
+        let allowLaunch = !musicRunning
         scriptQueue.async { [weak self] in
-            let result = Self.runAppleScript(source)
+            let result = Self.runAppleScript(source, allowLaunch: allowLaunch)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if result.permissionDenied {
@@ -375,8 +384,25 @@ final class AppleMusicBridge {
         let permissionDenied: Bool
     }
 
-    private nonisolated static func runAppleScript(_ source: String) -> ScriptExecutionResult {
-        guard let script = NSAppleScript(source: source) else {
+    /// Runs AppleScript against Music. Unless `allowLaunch` is set, the script is wrapped in an
+    /// `is running` check evaluated *inside* AppleScript, so a script queued just before the user
+    /// quits Music can never relaunch it.
+    private nonisolated static func runAppleScript(_ source: String, allowLaunch: Bool = false) -> ScriptExecutionResult {
+        if !allowLaunch {
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: musicBundleID)
+                .contains { !$0.isTerminated }
+            guard running else {
+                return ScriptExecutionResult(descriptor: nil, permissionDenied: false)
+            }
+        }
+        let fullSource = allowLaunch
+            ? source
+            : """
+            if application id "\(musicBundleID)" is running then
+            \(source)
+            end if
+            """
+        guard let script = NSAppleScript(source: fullSource) else {
             return ScriptExecutionResult(descriptor: nil, permissionDenied: false)
         }
         var errorInfo: NSDictionary?

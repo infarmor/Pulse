@@ -19,7 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let controller = VisualizerController()
     private var statusItem: NSStatusItem?
     private var hostingView: StatusItemHostingView<StatusBarPillView>?
-    private var lastPopoverCloseTime: Date = .distantPast
+    /// When the current/last close started (transient close fires on the very mouse-down that
+    /// should not reopen it).
+    private var popoverCloseStartedAt: Date = .distantPast
+    private var popoverIsClosing = false
+    private var reopenAfterClose = false
     /// Invisible window just under the status item that the popover is anchored to.
     /// Anchoring to the status bar button itself makes macOS draw a gray "selected" plate
     /// around the item (merged with the popover arrow) for as long as the popover is open.
@@ -65,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let update: @MainActor () -> Void = { [weak self] in
             guard let self, let window = self.statusItem?.button?.window else { return }
             let height = Double(window.frame.height)
+            pulseLog.notice("status item frame \(window.frame.debugDescription, privacy: .public)")
             if height > 0, abs(height - self.controller.menuBarHeight) > 0.5 {
                 self.controller.menuBarHeight = height
                 pulseLog.notice("menu bar height -> \(height, privacy: .public)")
@@ -140,7 +145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         let hostingController = NSHostingController(rootView: rootView)
         let pop = NSPopover()
-        pop.behavior = .transient
+        // Demo/screenshot mode keeps the menu open even if another app takes focus.
+        pop.behavior = DemoMode.isEnabled ? .applicationDefined : .transient
         pop.animates = true
         pop.delegate = self
         pop.contentViewController = hostingController
@@ -159,19 +165,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func togglePopover() {
-        guard let popover, let button = statusItem?.button else { return }
-        if popover.isShown {
-            popover.performClose(nil)
-        } else if Date().timeIntervalSince(lastPopoverCloseTime) < 0.25 {
+        guard let popover else { return }
+        if Date().timeIntervalSince(popoverCloseStartedAt) < 0.25 {
             // This very click already closed the transient popover; don't reopen it.
             return
+        }
+        if popoverIsClosing {
+            // Clicked during the close animation: reopen as soon as it finishes.
+            reopenAfterClose = true
+            return
+        }
+        if popover.isShown {
+            popover.performClose(nil)
         } else {
-            NSApp.activate(ignoringOtherApps: true)
-            if let anchor = positionPopoverAnchor() {
-                popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
-            } else {
-                popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            }
+            showPopover()
+        }
+    }
+
+    private func showPopover() {
+        guard let popover, let button = statusItem?.button, !popover.isShown else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        if let anchor = positionPopoverAnchor() {
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+        } else {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
     }
 
@@ -261,8 +278,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         controller.isPopoverOpen = true
     }
 
+    func popoverWillClose(_ notification: Notification) {
+        popoverCloseStartedAt = Date()
+        popoverIsClosing = true
+    }
+
     func popoverDidClose(_ notification: Notification) {
-        lastPopoverCloseTime = Date()
+        popoverIsClosing = false
+        if reopenAfterClose {
+            reopenAfterClose = false
+            DispatchQueue.main.async { [weak self] in self?.showPopover() }
+        }
         popoverAnchorWindow?.orderOut(nil)
         controller.isPopoverOpen = false
         statusItem?.isVisible = controller.shouldShowPill

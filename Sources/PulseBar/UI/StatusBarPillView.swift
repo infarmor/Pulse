@@ -78,7 +78,15 @@ struct CapsuleBackground: ViewModifier {
             solidBody(content)
         case .glass, .clearGlass:
             if #available(macOS 26.0, *) {
-                content.glassEffect(glass, in: Capsule(style: .continuous))
+                // Glass.tint isn't rendered for status items, so lay the artwork tint over the
+                // glass as a translucent fill under the content.
+                content
+                    .background {
+                        if let tint {
+                            Capsule(style: .continuous).fill(tint.opacity(highlighted ? 0.42 : 0.30))
+                        }
+                    }
+                    .glassEffect(glass, in: Capsule(style: .continuous))
             } else {
                 content
                     .background(
@@ -94,10 +102,7 @@ struct CapsuleBackground: ViewModifier {
     @available(macOS 26.0, *)
     private var glass: Glass {
         let base: Glass = style == .clearGlass ? .clear : .regular
-        if let tint {
-            return base.tint(tint.opacity(highlighted ? 0.50 : 0.35))
-        }
-        return highlighted ? base.tint(.white.opacity(0.12)) : base
+        return highlighted && tint == nil ? base.tint(.white.opacity(0.12)) : base
     }
 
     private func solidBody(_ content: Content) -> some View {
@@ -106,7 +111,7 @@ struct CapsuleBackground: ViewModifier {
                 ZStack {
                     Capsule(style: .continuous).fill(Self.solidFill)
                     if let tint {
-                        Capsule(style: .continuous).fill(tint.opacity(0.28))
+                        Capsule(style: .continuous).fill(tint.opacity(0.40))
                     }
                 }
             )

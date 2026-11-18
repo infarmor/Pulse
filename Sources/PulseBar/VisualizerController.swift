@@ -30,7 +30,9 @@ final class VisualizerController {
     var onPillVisibilityShouldUpdate: ((Bool) -> Void)?
     var onPillSizeChange: ((PillSize) -> Void)?
 
-    private let settingsStore = SettingsStore()
+    private let settingsStore = DemoMode.isEnabled
+        ? SettingsStore(defaults: UserDefaults(suiteName: "dev.pulsebar.demo") ?? .standard)
+        : SettingsStore()
     private let ringBuffer = AudioRingBuffer(capacity: 16_384)
     private let analyzer = SpectrumAnalyzer(fftSize: 2048)
     private let musicBridge = AppleMusicBridge()
@@ -56,7 +58,7 @@ final class VisualizerController {
     }
 
     init() {
-        self.settings = settingsStore.load()
+        self.settings = DemoMode.settingsOverride ?? settingsStore.load()
         self.sampleScratch = [Float](repeating: 0, count: analyzer.fftSize)
         self.launchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
 
@@ -108,6 +110,16 @@ final class VisualizerController {
     }
 
     func start() {
+        if DemoMode.isEnabled {
+            // Fictional track + generated cover; no Apple Music, no audio capture.
+            track = DemoMode.track
+            let cover = DemoMode.artwork()
+            artwork = cover
+            artworkAccent = Self.barTint(from: cover)
+            updateAnimationTimerState()
+            onPillVisibilityShouldUpdate?(shouldShowPill)
+            return
+        }
         musicBridge.start()
         audioEngine?.start()
         updateAnimationTimerState()
@@ -155,18 +167,29 @@ final class VisualizerController {
     // MARK: - Playback Actions
 
     func togglePlayPause() {
+        if DemoMode.isEnabled {
+            track.state = track.state == .playing ? .paused : .playing
+            updateAnimationTimerState()
+            return
+        }
         musicBridge.togglePlayPause()
     }
 
     func nextTrack() {
+        guard !DemoMode.isEnabled else { return }
         musicBridge.nextTrack()
     }
 
     func previousTrack() {
+        guard !DemoMode.isEnabled else { return }
         musicBridge.previousTrack()
     }
 
     func seek(to seconds: TimeInterval) {
+        if DemoMode.isEnabled {
+            track.position = min(track.duration, max(0, seconds))
+            return
+        }
         musicBridge.seek(to: seconds)
     }
 
@@ -285,6 +308,7 @@ final class VisualizerController {
     }
 
     private func handleMusicUpdate(track newTrack: TrackInfo, artwork newArtwork: NSImage?, permissionDenied: Bool) {
+        guard !DemoMode.isEnabled else { return }
         let wasVisible = shouldShowPill
         track = newTrack
         if newArtwork !== artwork {
@@ -346,7 +370,7 @@ final class VisualizerController {
         updateAnimationTimerState()
         onPillVisibilityShouldUpdate?(shouldShowPill || isPopoverOpen)
 
-        if isPopoverOpen {
+        if isPopoverOpen && !DemoMode.isEnabled {
             refreshLaunchAtLoginStatus()
             musicBridge.refreshFullState()
             let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -385,8 +409,16 @@ final class VisualizerController {
 
     private func stepFrame() {
         let now = Date()
-        let dt = max(1.0 / 120.0, min(0.1, now.timeIntervalSince(lastFrameDate)))
+        let elapsed = now.timeIntervalSince(lastFrameDate)
+        let dt = max(1.0 / 120.0, min(0.1, elapsed))
         lastFrameDate = now
+
+        if DemoMode.isEnabled {
+            bars = track.state == .playing
+                ? DemoMode.bars(at: now.timeIntervalSinceReferenceDate)
+                : [Double](repeating: 0, count: SpectrumAnalyzer.barCount)
+            return
+        }
 
         let active = isActivelyVisualizing
         let stats = ringBuffer.copyLatest(analyzer.fftSize, into: &sampleScratch)
@@ -433,7 +465,7 @@ final class VisualizerController {
 
         // Advance the scrubber twice a second instead of every frame (keeps the popover calm).
         if isPopoverOpen && track.state == .playing && track.duration > 0 {
-            positionAccumulator += dt
+            positionAccumulator += min(elapsed, 1.0)   // real time, even at the 4 Hz probe
             if positionAccumulator >= 0.5 {
                 track.position = min(track.duration, track.position + positionAccumulator)
                 positionAccumulator = 0

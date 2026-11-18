@@ -9,7 +9,12 @@ struct PlayerPopoverView: View {
 
     @State private var isDraggingScrubber = false
     @State private var dragProgress: Double = 0
-    @AppStorage("dev.pulsebar.ui.settingsExpanded") private var settingsExpanded = false
+    @AppStorage("dev.pulsebar.ui.settingsExpanded") private var settingsExpandedStored = false
+
+    private var settingsExpanded: Bool {
+        get { DemoMode.settingsExpandedOverride ?? settingsExpandedStored }
+        nonmutating set { settingsExpandedStored = newValue }
+    }
 
     private static let width: CGFloat = 300
     private static let appVersion =

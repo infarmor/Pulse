@@ -231,4 +231,35 @@ struct PulseBarCoreTests {
         let high = bars(sensitivity: 1.6)
         #expect(high[5] > low[5], "low: \(low) high: \(high)")
     }
+
+    @Test("Digital silence never draws bars, even at max sensitivity")
+    func silenceStaysFlat() {
+        let analyzer = SpectrumAnalyzer(fftSize: 2_048)
+        let zeros = [Float](repeating: 0, count: 2_048)
+        var bars: [Double] = []
+        for _ in 0..<600 {
+            bars = analyzer.process(
+                samples: zeros, sampleRate: 48_000, isActive: true,
+                style: .island, sensitivity: 1.8, deltaTime: 0.02
+            )
+        }
+        #expect(bars.allSatisfy { $0 == 0 }, "bars: \(bars)")
+    }
+
+    @Test("Very quiet audio (-60 dBFS) animates within a second of starting")
+    func quietStartIsFast() {
+        let analyzer = SpectrumAnalyzer(fftSize: 2_048)
+        let sampleRate = 48_000.0
+        let quiet = (0..<2_048).map { i -> Float in
+            0.001 * sinf(Float(2.0 * .pi * 170.0 * Double(i) / sampleRate))
+        }
+        var bars: [Double] = []
+        for _ in 0..<50 {   // 1 s at 50 fps
+            bars = analyzer.process(
+                samples: quiet, sampleRate: sampleRate, isActive: true,
+                style: .classic, sensitivity: 1.0, deltaTime: 0.02
+            )
+        }
+        #expect(bars[1] > 0.6, "bars: \(bars)")
+    }
 }

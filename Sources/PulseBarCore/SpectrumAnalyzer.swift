@@ -17,6 +17,8 @@ public final class SpectrumAnalyzer {
     private var squaredMagnitudes: [Float]
 
     private var agcPeakDB: Float = SpectrumAnalyzer.initialAGCPeakDB
+    /// Snap the AGC to the first real frame after launch / reset instead of crawling to it.
+    private var agcNeedsSeed = true
     private static let initialAGCPeakDB: Float = -30.0
     private var smoothedBars: [Double] = [Double](repeating: 0, count: barCount)
 
@@ -88,9 +90,8 @@ public final class SpectrumAnalyzer {
             )
             targets = mapBandsToStyle(rawBands, style: style)
         } else {
+            // Keep the last calibration while idle: resuming at the same volume is instant.
             targets = [Double](repeating: 0, count: Self.barCount)
-            // Slowly drift AGC toward a neutral level while idle so the next track re-calibrates quickly.
-            agcPeakDB += (Self.initialAGCPeakDB - agcPeakDB) * Float(min(1.0, dt * 0.5))
         }
 
         let attackAlpha = 1.0 - exp(-dt / 0.030)
@@ -110,6 +111,7 @@ public final class SpectrumAnalyzer {
     /// Resets internal smoothing and AGC history immediately.
     public func reset() {
         agcPeakDB = Self.initialAGCPeakDB
+        agcNeedsSeed = true
         for i in 0..<Self.barCount {
             smoothedBars[i] = 0
         }
@@ -144,7 +146,7 @@ public final class SpectrumAnalyzer {
         let binHz = sampleRate / Double(fftSize)
         let normScale = 1.0 / Float(fftSize)
         var bandDBs = [Float](repeating: -80.0, count: Self.barCount)
-        var frameMaxDB: Float = -80.0
+        var frameMaxDB: Float = -120.0
 
         for (index, range) in Self.bandRanges.enumerated() {
             let startBin = max(1, Int(floor(range.low / binHz)))
@@ -179,12 +181,18 @@ public final class SpectrumAnalyzer {
 
         // Rolling automatic gain control. The process tap delivers audio *after* the system
         // volume, so the level can sit anywhere from ~0 dBFS down to -70 dBFS depending on
-        // the volume slider. Track the recent peak over that whole range: fast attack,
-        // ~5 dB/s release, so bars stay lively at any volume.
+        // the volume slider. Track the recent peak over that whole range: seed on the first
+        // frame, fast attack, and a release that speeds up with the gap (big drops in level
+        // re-calibrate within ~1 s, small dips between beats barely move it).
+        if agcNeedsSeed {
+            agcPeakDB = frameMaxDB
+            agcNeedsSeed = false
+        }
         if frameMaxDB > agcPeakDB {
             agcPeakDB += (frameMaxDB - agcPeakDB) * 0.35
         } else {
-            agcPeakDB = max(-90.0, agcPeakDB - Float(deltaTime) * 5.0)
+            let gap = agcPeakDB - frameMaxDB
+            agcPeakDB = max(-90.0, agcPeakDB - Float(deltaTime) * max(5.0, gap * 1.5))
         }
         let ceilingDB = min(0.0, agcPeakDB + 1.5)
         // Higher sensitivity = wider window below the peak = taller bars for quieter detail.

@@ -50,10 +50,10 @@
     <td align="center"><img src="docs/screenshots/bg-dark.png" alt="Фон «Тёмное»"><br><sub>Тёмное</sub></td>
   </tr>
   <tr>
-    <th align="left">Полосы</th>
-    <td align="center"><img src="docs/screenshots/color-bars.png" alt="Полосы в цвет обложки"><br><sub>В цвет обложки</sub></td>
-    <td align="center"><img src="docs/screenshots/color-off.png" alt="Обычные полосы"><br><sub>Обычные</sub></td>
-    <td></td>
+    <th align="left">Цвет обложки</th>
+    <td align="center"><img src="docs/screenshots/color-bars.png" alt="Полосы в цвет обложки"><br><sub>Полосы</sub></td>
+    <td align="center"><img src="docs/screenshots/color-both.png" alt="Полосы и фон в цвет обложки"><br><sub>Полосы и фон</sub></td>
+    <td align="center"><img src="docs/screenshots/color-off.png" alt="Без цвета обложки"><br><sub>Выключено</sub></td>
   </tr>
 </table>
 
